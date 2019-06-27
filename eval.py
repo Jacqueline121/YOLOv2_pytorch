@@ -1,132 +1,113 @@
-import numpy as np
 import torch
 from config.config import cfg
 from utils.anchors import generate_anchors
-from utils.bbox_operation import xywh2xyxy, bbox_overlaps
+from utils.box_operation import box_transform_inv, xywh2xyxy, box_overlaps
 
 
-def generate_pred_boxes(coord_pred):
-    all_anchors = generate_anchors()
+def get_pred_boxes(coord):
+    anchors = generate_anchors()
+    pred_boxes = box_transform_inv(anchors, coord) # (x, y, w, h)
+    return pred_boxes  # (H*W*A, 4)
 
-    pred_boxes = coord_pred.new(*coord_pred.size())
 
-    pred_boxes[:, 0] = coord_pred[:, 0] + all_anchors[:, 0]
-    pred_boxes[:, 1] = coord_pred[:, 1] + all_anchors[:, 1]
-    pred_boxes[:, 2] = coord_pred[:, 2] + all_anchors[:, 2]
-    pred_boxes[:, 3] = coord_pred[:, 3] + all_anchors[:, 3]
+def filter_boxes(pred_boxes, conf, cls, conf_thresh):
+    cls_max, cls_argmax = torch.max(cls, dim=-1, keepdim=True)  # (H*W*A, 1)
+    conf_cls = conf * cls_max
+
+    keep = (conf_cls > conf_thresh).view(-1)
+
+    pred_boxes_keep = pred_boxes[keep, :]
+    conf_keep = conf[keep, :]
+    cls_max_keep = cls_max[keep, :]
+    cls_argmax_keep = cls_argmax[keep, :]
+
+    return pred_boxes_keep, conf_keep, cls_max_keep, cls_argmax_keep
+
+
+def rescale_boxes(pred_boxes, im_info):
+    img_width = im_info[0].cpu().numpy()
+    img_height = im_info[1].cpu().numpy()
+
+    test_width, test_height = cfg.TEST_SIZE
+
+    scale_width = test_width / img_width
+    scale_height = test_height / img_height
+
+    pred_boxes *= cfg.STRIDE
+
+    pred_boxes[:, 0::2] /= scale_width
+    pred_boxes[:, 1::2] /= scale_height
+
+    pred_boxes = xywh2xyxy(pred_boxes)
+
+    pred_boxes[:, 0::2].clamp_(0, img_width - 1)
+    pred_boxes[:, 1::2].clamp_(0, img_height - 1)
 
     return pred_boxes
 
 
-def filter_boxes(pred_boxes, conf_pred, cls_pred, conf_thresh=0.6):
-    cls_max, cls_argmax = torch.argmax(cls_pred, dim=-1, keepdim=True)
-    cls_conf = conf_pred * cls_max
-    keep = (cls_conf > conf_thresh).view(-1)
-
-    keep_boxes = pred_boxes[keep, :]
-    keep_conf = conf_pred[keep, :]
-    keep_cls_max = cls_max[keep, :]
-    keep_cls_argmax = cls_argmax[keep, :]
-
-    return keep_boxes, keep_conf, keep_cls_max, keep_cls_argmax
-
-
-def scale_boxes(boxes, im_info):
-    h = im_info['height']
-    w = im_info['width']
-
-    input_h, input_w = cfg.TEST_SIZE
-    scale_h, scale_w = input_h / h, input_w / w
-
-    boxes *= cfg.REDUCTION
-
-    boxes[:, 0::2] /= scale_w
-    boxes[:, 1::2] /= scale_h
-
-    boxes = xywh2xyxy(boxes)
-
-    boxes[:, 0::2].clamp_(0, w-1)
-    boxes[:, 1::2].clamp_(0, h-1)
-
-    return boxes
-
-
-def nms(boxes, conf, nms_thresh):
-    conf_sort_index = torch.sort(conf, dim=0, descending=True)[1]
+def nms(pred_boxes, conf, nms_thresh):
+    order = torch.sort(conf, dim=0, descending=True)[1]
     keep = []
-    while conf_sort_index.numel() > 0:
-        i = conf_sort_index[0]
-        keep.append(i)
 
-        if conf_sort_index.numel == 1:
+    while order.numel() > 0:
+        keep.append(order[0])
+
+        if order.numel() == 1:
             break
 
-        cur_box = boxes[conf_sort_index[0], :].view(-1, 4)
-        res_box = boxes[conf_sort_index[1:], :].view(-1, 4)
+        cur_box = pred_boxes[order[0], :].view(-1, 4)
+        res_boxes = pred_boxes[order[1:], :].view(-1, 4)
 
-        ious = bbox_overlaps(cur_box, res_box).view(-1)
+        ious = box_overlaps(cur_box, res_boxes).view(-1)
 
-        inds = torch.nonzero(ious < nms_thresh).squeeze()
-
-        conf_sort_index = conf_sort_index[inds + 1].view(-1)
+        idxs = torch.nonzero(ious < nms_thresh).squeeze()
+        order = order[idxs + 1].view(-1)
 
     return torch.LongTensor(keep)
 
 
 def eval(output, im_info, conf_thresh, nms_thresh):
+    coord = output[0].view(-1, 4).cpu()   # (H*W*anchor_num, 4)
+    conf = output[1].view(-1, 1).cpu()    # (H*W*anchor_num, 1)
+    cls = output[2].view(-1, 20).cpu()    # (H*W*anchor_num, 20)
 
-    coord_pred = output[0].view(-1, 4).cpu()  # shape: (A, H*W, 4)
-    conf_pred = output[1].view(-1, 1).cpu()  # shape: (A, H*W, 1)
-    cls_pred = output[2].view(-1, 20).cpu()  # shape: (A, H*W, 20)
+    # 1. generate predicted boxes
+    pred_boxes = get_pred_boxes(coord)
 
-    height = im_info['height']
-    width = im_info['width']
+    # 2. filter boxes whose conf is less than conf_thresh
+    pred_boxes, conf, cls_max, cls_argmax = \
+        filter_boxes(pred_boxes, conf, cls, conf_thresh)
 
-    class_num = cls_pred.size(1)
-
-    pred_boxes = generate_pred_boxes(coord_pred)
-
-    boxes, conf, cls_max, cls_argmax = \
-        filter_boxes(pred_boxes, conf_pred, cls_pred, conf_thresh)
-
-    if boxes.size(0) == 0:
+    if pred_boxes.size(0) == 0:
         return []
 
-    boxes = scale_boxes(boxes, im_info)
+    # 3. rescale the pred_boxes
+    pred_boxes = rescale_boxes(pred_boxes, im_info)
 
+    # 4. nms
     detections = []
     cls_argmax = cls_argmax.view(-1)
+    for i in range(cfg.CLASS_NUM):
+        idxs = torch.nonzero(cls_argmax == i).squeeze()
 
-    # apply class-wise nms
-    for cls in range(class_num):
-        cls_mask = (cls_argmax == cls)
-        inds = torch.nonzero(cls_mask).squeeze()
-
-        if inds.numel() == 0:
+        if idxs.numel() == 0:
             continue
 
-        boxes_cls = boxes[inds, :].view(-1, 4)
-        conf_cls = conf[inds, :].view(-1, 1)
-        cls_max_cls = cls_max[inds].view(-1, 1)
-        cls_label_cls = cls_argmax[inds].view(-1, 1)
+        pred_boxes_cls = pred_boxes[idxs, :].view(-1, 4)
+        conf_cls = conf[idxs, :].view(-1, 1)
+        cls_max_cls = cls_max[idxs, :].view(-1, 1)
+        cls_argmax_cls = cls_argmax[idxs].view(-1, 1)
 
-        nms_keep = nms(boxes_cls, conf_cls.view(-2), nms_thresh)
+        nms_keep = nms(pred_boxes_cls, conf_cls, nms_thresh)
 
-        boxes_cls_keep = boxes_cls[nms_keep, :]
-        conf_cls_keep = conf_cls[nms_keep, :]
-        cls_max_cls_keep = cls_max_cls.view(-1, 1)[nms_keep, :]
-        cls_label_cls_keep = cls_label_cls.view(-1, 1)[nms_keep, :]
+        pred_boxes_cls = pred_boxes_cls[nms_keep, :]
+        conf_cls = conf_cls[nms_keep, :]
+        cls_max_cls = cls_max_cls[nms_keep, :]
+        cls_label = cls_argmax_cls[nms_keep, :].float()
 
-        seq = [boxes_cls_keep, conf_cls_keep, cls_max_cls_keep, cls_label_cls_keep.float()]
+        detections_cls = torch.cat([pred_boxes_cls, conf_cls, cls_max_cls, cls_label], dim=-1)
 
-        detections_cls = torch.cat(seq, dim=-1)
         detections.append(detections_cls)
 
     return torch.cat(detections, dim=0)
-
-
-
-
-
-
-

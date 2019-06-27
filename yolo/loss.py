@@ -1,189 +1,139 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch.autograd import Variable
+from utils.anchors import generate_anchors
 from config.config import cfg
-from utils.bbox_operation import bbox_overlaps, xyxy2xywh, xywh2xyxy
+from utils.box_operation import box_transform, box_transform_inv, box_overlaps, xyxy2xywh, xywh2xyxy
 
 
-def yolo_loss(output, ground_truth, height, width):
-    """
-    calculate the target value for the predicted bounding box
-    :param output: output of the darknet, size:[B, C, H, W]
-    :param gt: ground truth, size:[B, N, 5], (x1, y1, x2, y2, o)
-    :return: masks and targets
+def yolo_loss(output_pred, ground_truth, height, width):
+    '''
 
+    :param output_pred: is Variable
+    :param ground_truth:  is data
+    :param height:
+    :param width:
+    :return:
+    '''
 
-    where:
-    B: is the batch size, equal to 10
-    C: is the channel of the output, equal to num_anchor*(5 + num_class)
-    H: is the height of the output, equal to 7
-    W: is the width of the output, equal to 7
-    N: is the number of ground truth boxes
-    """
+    coord_pred = output_pred[0].data  # (16, 196*5, 4)  data
+    conf_pred = output_pred[1].data  # (16, 196*5, 1)
+    cls_pred = output_pred[2].data  # (16*196*5, 20)
 
-    # define parameters
-    anchors = cfg.ANCHORS
-    reduction = cfg.REDUCTION
-    coord_scale = cfg.COORD_SCALE
-    noobject_scale = cfg.NO_OBJECT_SCALE
-    object_scale = cfg.OBJECT_SCALE
-    class_scale = cfg.CLASS_SCALE
-    thresh = cfg.THRESH
-    class_num = cfg.CLASS_NUM
+    gt_boxes = ground_truth[0]  # (16, 6, 4)， 6 is the num_obj
+    gt_classes = ground_truth[1]  # (16, 6) data
+    num_obj = ground_truth[2]  # (16， 1)
 
-    anchor_num = len(anchors)
-    anchor_dim = len(anchors[0])
-    anchors = torch.Tensor(anchors)
+    batch_size = coord_pred.size(0)
+    anchor_num = len(cfg.ANCHORS)
 
-    if anchor_dim == 4:
-        anchors[:, :2] = 0
-    else:
-        anchors = torch.cat([torch.zeros_like(anchors), anchors], 1)
+    cell_anchors_xywh = generate_anchors()  # (196*5, 4)
 
-    coord = output[0]  # shape: (B, H*W, A, 4)
-    conf = output[1]  # shape: (B, H*W, A, 1)
-    cls = output[2]  # shape: (B*H*W*A, 20)
+    anchors_xywh = cell_anchors_xywh.clone()
+    anchors_xywh[:, 0:2] = anchors_xywh[:, 0:2] + 0.5
 
-    gt_boxes_batch = ground_truth[0]
-    gt_classes_batch = ground_truth[1]
-    num_obj_batch = ground_truth[2]
+    if cfg.DEBUG:
+        print('all cell:', cell_anchors_xywh[:12, :])
+        print('all anchors:', anchors_xywh[:12, :])
 
-    batch_size = conf.size(0)
-
-    # calculate the coordinates of the predicted boxes
-
-    # generate all anchors
-    pred_boxes_batch = torch.FloatTensor(batch_size, height * width * anchor_num, 4)
-
-    ctr_x = torch.range(0, width - 1).repeat(height, 1).contiguous().view(width * height)
-    ctr_y = torch.range(0, height - 1).repeat(width, 1).t().contiguous().view(width * height)
-    anchor_w = anchors[:, 2].contiguous().view(anchor_num, 1)
-    anchor_h = anchors[:, 3].contiguous().view(anchor_num, 1)
-
+    anchors_xyxy = xywh2xyxy(anchors_xywh)
+    
     if torch.cuda.is_available():
-        pred_boxes_batch = pred_boxes_batch.cuda()
-        ctr_x = ctr_x.cuda()
-        ctr_y = ctr_y.cuda()
-        anchor_w = anchor_w.cuda()
-        anchor_h = anchor_h.cuda()
-        anchors = anchors.cuda()
+        cell_anchors_xywh = cell_anchors_xywh.cuda()
+        anchors_xyxy = anchors_xyxy.cuda()
 
-    # bbox_transform_inv
-    coord_copy = coord.clone()
-    coord_copy = coord_copy.permute(0, 2, 3, 1)  # shape: (10, 5, 4, 169)
-    pred_boxes_batch[:, :, 0] = (coord_copy[:, :, 0].detach() + ctr_x).view(batch_size, anchor_num*height*width)
-    pred_boxes_batch[:, :, 1] = (coord_copy[:, :, 1].detach() + ctr_y).view(batch_size, anchor_num*height*width)
-    pred_boxes_batch[:, :, 2] = (coord_copy[:, :, 2].detach() * anchor_w).view(batch_size, anchor_num*height*width)
-    pred_boxes_batch[:, :, 3] = (coord_copy[:, :, 3].detach() * anchor_h).view(batch_size, anchor_num*height*width)
+    coord_target = coord_pred.new_zeros((batch_size, height * width, anchor_num, 4))
+    conf_target = conf_pred.new_zeros((batch_size, height * width, anchor_num, 1))
+    cls_target = cls_pred.new_zeros((batch_size, height * width, anchor_num, 1))
 
-    #pred_boxes_batch = pred_boxes_batch.cpu()
-
-    # build target
-    # coord_target = torch.zeros(batch_size, anchor_num, 4, height * width, requires_grad=False)
-    # conf_target = torch.zeros(batch_size, anchor_num, height * width, requires_grad=False)
-    # cls_target = torch.zeros(batch_size, anchor_num, height * width, requires_grad=False)
-    #
-    # coord_mask = torch.zeros(batch_size, anchor_num, 1, height*width, requires_grad=False)
-    # conf_mask = torch.ones(batch_size, anchor_num, height*width, requires_grad=False) * noobject_scale
-    # cls_mask = torch.zeros(batch_size, anchor_num, height*width, requires_grad=False).byte()
-
-    coord_target = torch.zeros(batch_size, height * width, anchor_num, 4, requires_grad=False)
-    conf_target = torch.zeros(batch_size,  height * width, anchor_num, requires_grad=False)
-    cls_target = torch.zeros(batch_size, height * width, anchor_num, requires_grad=False)
-
-    coord_mask = torch.zeros(batch_size, height * width, anchor_num, 1, requires_grad=False)
-    conf_mask = torch.ones(batch_size, height * width, anchor_num, requires_grad=False) * noobject_scale
-    cls_mask = torch.zeros(batch_size, height * width, anchor_num, requires_grad=False).byte()
+    coord_mask = coord_pred.new_zeros((batch_size, height * width, anchor_num, 1))
+    conf_mask = conf_pred.new_ones((batch_size, height * width, anchor_num, 1)) * cfg.NO_OBJECT_SCALE
+    cls_mask = cls_pred.new_zeros((batch_size, height * width, anchor_num, 1))
 
     for i in range(batch_size):
-        # if len(gt_boxes_xyxy) == 0:
-        #     continue
+        gt_num = num_obj[i].item()
+        gt_boxes_xyxy = gt_boxes[i, :gt_num, :]
+        gt_class = gt_classes[i, :gt_num]
 
-        num_obj = num_obj_batch[i]
-        pred_boxes_xywh = pred_boxes_batch[i]
-        gt_boxes_xyxy = gt_boxes_batch[i][:num_obj, :]  # shape: (num_obj, 4)
-        gt_classes = gt_classes_batch[i][:num_obj]
+        gt_boxes_xyxy[:, 0::2] = gt_boxes_xyxy[:, 0::2] * width
+        gt_boxes_xyxy[:, 1::2] = gt_boxes_xyxy[:, 1::2] * height
 
-       # gt_boxes_xywh = torch.zeros_like(gt_boxes_xyxy)  # shape: (num_obj, 4)
-       # for j, gt in enumerate(gt_boxes_xyxy):
-        gt_boxes_xywh = xyxy2xywh(gt_boxes_xyxy) / reduction
+        gt_boxes_xywh = xyxy2xywh(gt_boxes_xyxy)
 
-        pred_boxes_xyxy = xywh2xyxy(pred_boxes_xywh)
-        gt_pred_iou = bbox_overlaps(gt_boxes_xyxy, pred_boxes_xyxy)  # shape: (num_obj, H*W*A)
-        mask = (gt_pred_iou > thresh).sum(0) >= 1
-        conf_mask[i][mask.view_as(conf_mask[i])] = 0  # object: 0, no-object: 1
+        # 1. calculate the predicted box
+        pred_box_xywh = box_transform_inv(cell_anchors_xywh, coord_pred[i])
+        pred_box_xyxy = xywh2xyxy(pred_box_xywh)
 
-        gt_boxes_wh = gt_boxes_xywh.clone()
-        gt_boxes_wh[:, :2] = 0
+        # 2. calculate the IOU between each pred_box and gt_boxes
+        pred_gt_iou = box_overlaps(pred_box_xyxy, gt_boxes_xyxy)  # conf_target (pred_num, gt_num)
+        pred_gt_iou = pred_gt_iou.view(-1, anchor_num, gt_num)
 
-        gt_boxes_wh = xywh2xyxy(gt_boxes_wh)
-        anchors_xyxy = xywh2xyxy(anchors)
-        gt_anchor_iou = bbox_overlaps(gt_boxes_wh, anchors_xyxy)  # shape: (num_obj, A)
-        _, gt_anchor_argmax = gt_anchor_iou.max(1)   # shape: (num_obj, 1)?
-        # the index of the best anchor for each gt_boxes
+        max_iou, _ = torch.max(pred_gt_iou, dim=-1, keepdim=True)
 
-        for j, gt in enumerate(gt_boxes_xywh):
-            gi = min(width - 1, max(0, int(gt_boxes_xywh[j, 0])))
-            gj = min(height - 1, max(0, int(gt_boxes_xywh[j, 1])))
-            best_anchor = gt_anchor_argmax[j]
+        if cfg.DEBUG:
+            print('ious:', pred_gt_iou)
 
-            # coord_target[i][best_anchor][0][gj * width + gi] = gt_boxes_xywh[j, 0] - gi
-            # coord_target[i][best_anchor][1][gj * width + gi] = gt_boxes_xywh[j, 1] - gj
-            # coord_target[i][best_anchor][2][gj * width + gi] = torch.log(max(gt_boxes_xywh[j, 2], 1.0) / anchors[best_anchor, 2])
-            # coord_target[i][best_anchor][3][gj * width + gi] = torch.log(max(gt_boxes_xywh[j, 3], 1.0) / anchors[best_anchor, 3])
+        num_pos = torch.nonzero(max_iou.view(-1) > cfg.THRESH).numel()
+        if num_pos > 0:
+            conf_mask[i][max_iou >= cfg.THRESH] = 0
 
-            coord_target[i][gj * width + gi][best_anchor][0] = gt_boxes_xywh[j, 0] - gi
-            coord_target[i][gj * width + gi][best_anchor][1] = gt_boxes_xywh[j, 1] - gj
-            coord_target[i][gj * width + gi][best_anchor][2] = torch.log(
-                max(gt_boxes_xywh[j, 2], 1.0) / anchors[best_anchor, 2])
-            coord_target[i][gj * width + gi][best_anchor][3] = torch.log(
-                max(gt_boxes_xywh[j, 3], 1.0) / anchors[best_anchor, 3])
+        # 3. calculate the IOU between gt_boxes and anchors
+        anchors_gt_iou = box_overlaps(anchors_xyxy, gt_boxes_xyxy).view(-1, anchor_num, gt_num)  # decide which anchor is responsible for the gt_box
 
-            # conf_target[i][best_anchor][gj * width + gi] = gt_pred_iou[j][best_anchor * height * width + gj * width + gi]
-            # cls_target[i][best_anchor][gj * width + gi] = int(gt[4])
-            #
-            # coord_mask[i][best_anchor][0][gj * width + gi] = 1
-            # cls_mask[i][best_anchor][gj * width + gi] = 1
-            # conf_mask[i][best_anchor][gj * width + gi] = object_scale
+        # 4. iterate over each gt_boxes
+        for j in range(gt_num):
+            gt_box_xywh = gt_boxes_xywh[j, :]
+            g_x = torch.floor(gt_box_xywh[0])
+            g_y = torch.floor(gt_box_xywh[1])
+            # cell_idxth cell is responsible for this gt_box
+            cell_idx = (g_y * width + g_x).long()
 
-            conf_target[i][gj * width + gi][best_anchor] = gt_pred_iou[j][
-                best_anchor * height * width + gj * width + gi]
-            cls_target[i][gj * width + gi][best_anchor] = int(gt_classes[j])
+            best_anchor = torch.argmax(anchors_gt_iou[cell_idx, :, j])
 
-            coord_mask[i][gj * width + gi][best_anchor][0] = 1  # object: 1, no-object: 0
-            cls_mask[i][gj * width + gi][best_anchor] = 1   # object: 1, no-object: 0
-            conf_mask[i][gj * width + gi][best_anchor] = object_scale
-            # best bbox: object_scale, thresh>0.6 but not the best: 0, no-object: 1
+            assigned_cell_anchor = cell_anchors_xywh.view(-1, anchor_num, 4)[cell_idx, best_anchor, :].unsqueeze(0)
+            gt_box = gt_box_xywh.unsqueeze(0)
+            target = box_transform(assigned_cell_anchor, gt_box)
+
+            if cfg.DEBUG:
+                print('assigned cell:', assigned_cell_anchor)
+                print('gt:', gt_box)
+                print('target:', target)
+
+            coord_target[i, cell_idx, best_anchor, :] = target.unsqueeze(0)
+            coord_mask[i, cell_idx, best_anchor, :] = 1
+
+            conf_target[i, cell_idx, best_anchor, :] = max_iou[cell_idx, best_anchor, :]
+            conf_mask[i, cell_idx, best_anchor, :] = cfg.OBJECT_SCALE
+
+            if cfg.DEBUG:
+                print('conf_target:', max_iou[cell_idx, best_anchor, :])
+
+            cls_target[i, cell_idx, best_anchor, :] = gt_class[j]
+            cls_mask[i, cell_idx, best_anchor, :] = 1
 
     coord_mask = coord_mask.expand_as(coord_target)
-    cls_target = cls_target[cls_mask].view(-1).long() - 1
-    cls_mask = cls_mask.view(-1, 1).repeat(1, class_num)  # shape: (B*H*W*A, 20)
-    cls = cls[cls_mask].view(-1, class_num)
 
-    if torch.cuda.is_available():
-        coord_target = coord_target.cuda()
-        conf_target = conf_target.cuda()
-        cls_target = cls_target.cuda()
-        coord_mask = coord_mask.cuda()
-        conf_mask = conf_mask.cuda()
-        cls_mask = cls_mask.cuda()
+    coord_pred_variable, conf_pred_variable, cls_pred_variable = output_pred[0], output_pred[1], output_pred[2]
 
-    conf_mask = conf_mask.sqrt()
+    coord_target = Variable(coord_target.view(batch_size, -1, 4))
+    coord_mask = Variable(coord_mask.view(batch_size, -1, 4))
+    conf_target = Variable(conf_target.view(batch_size, -1, 1))
+    conf_mask = Variable(conf_mask.view(batch_size, -1, 1))
+    cls_target = Variable(cls_target.view(-1).long())
+    cls_mask = Variable(cls_mask.view(-1).long())
 
-    # compute loss
-    # MSE = nn.MSELoss(size_average=False)
-    # CrossEntropy = nn.CrossEntropyLoss(size_average=False)
-    coord_loss = coord_scale * F.mse_loss(coord * coord_mask, coord_target * coord_mask, reduction='sum') / batch_size
-    conf_loss = F.mse_loss(conf * conf_mask, conf_target * conf_mask, reduction='sum') / batch_size
-    cls_loss = class_scale * 2 * F.cross_entropy(cls, cls_target, reduction='sum') / batch_size
+    keep = cls_mask.nonzero().squeeze(1)
+    cls_pred_variable = cls_pred_variable[keep, :]
+    cls_target = cls_target[keep] - 1
+
+    # calculate loss
+    coord_loss = cfg.COORD_SCALE * F.mse_loss(coord_pred_variable * coord_mask,
+                                              coord_target * coord_mask, reduction='sum') / batch_size / 2.0
+    conf_loss = F.mse_loss(conf_pred_variable * conf_mask,
+                           conf_target * conf_mask, reduction='sum') / batch_size / 2.0
+    cls_loss = cfg.CLASS_SCALE * F.cross_entropy(cls_pred_variable, cls_target, reduction='sum') / batch_size
 
     return coord_loss, conf_loss, cls_loss
-
-
-
-
-
-
 
 
 

@@ -12,7 +12,6 @@ from torch.utils.data import Dataset
 from config.config import cfg
 from utils.image_augmentation import augment_img
 
-
 class RoiDataset(Dataset):
     def __init__(self, imdb, train=True):
         super(RoiDataset, self).__init__()
@@ -52,7 +51,7 @@ class RoiDataset(Dataset):
             return im_data_resize, boxes, gt_classes, num_obj
 
         else:
-            input_h, input_w = cfg.test_input_size
+            input_h, input_w = cfg.TEST_SIZE
             im_data = im_data.resize((input_w, input_h))
             im_data_resize = torch.from_numpy(np.array(im_data)).float() / 255
             im_data_resize = im_data_resize.permute(2, 0, 1)

@@ -39,7 +39,7 @@ class GlobalAvgPool2d(nn.Module):
 
 
 class Darknet19(nn.Module):
-    def __init__(self, class_num):
+    def __init__(self, class_num=1000):
         super(Darknet19, self).__init__()
 
         self.block1 = nn.Sequential(conv3x3(3, 32))
@@ -78,7 +78,6 @@ class Darknet19(nn.Module):
         self.softmax = softmax()
 
     def forward(self, input):
-
         out = self.block1(input)
         out = self.block2(out)
         out = self.block3(out)

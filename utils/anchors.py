@@ -4,29 +4,34 @@ from config.config import cfg
 
 
 def generate_anchors():
-    anchors = cfg.ANCHORS
-    anchor_num = len(anchors)
-    anchor_dim = len(anchors[0])
-
-    if anchor_dim == 4:
-        anchors[:, :2] = 0
-    else:
-        anchors = np.cat([np.zeros_like(anchors), anchors], 1)
-
-    stride = cfg.REDUCTION
-
-    height, width = cfg.TEST_SIZE / stride
+    anchors = torch.FloatTensor(cfg.ANCHORS)
+    anchor_num = anchors.size(0)
+    height = int(cfg.INPUT_SIZE[0] / cfg.STRIDE)
+    width = int(cfg.INPUT_SIZE[1] / cfg.STRIDE)
 
     A = anchor_num
     K = height * width
-    shift_x = np.arange(0, width)
-    shift_y = np.arange(0, height)
-    shifts_x, shifts_y = np.meshgrid(shift_x, shift_y)
-    shifts = np.vstack((shifts_x.ravel(), shifts_y.ravel(), shifts_x.ravel(), shifts_y.ravel())).transpose()
 
-    all_anchors = anchors.reshape(1, A, 4) + shifts.reshape(K, 1, 4)
-    all_anchors = all_anchors.reshape(-1, 4)
+    shift_x = torch.arange(0, height)
+    shift_y = torch.arange(0, width)
+    shifts_x, shifts_y = torch.meshgrid([shift_x, shift_y])
 
-    all_anchors = torch.from_numpy(all_anchors)
+    ctrs_x = shifts_x.t().contiguous().float()
+    ctrs_y = shifts_y.t().contiguous().float()
+
+    ctrs = torch.cat([ctrs_x.view(-1, 1), ctrs_y.view(-1, 1)], dim=-1)
+
+    all_anchors = torch.cat([ctrs.view(K, 1, 2).expand(K, A, 2),
+                             anchors.view(1, A, 2).expand(K, A, 2)], dim=-1)
+
+    all_anchors = all_anchors.contiguous().view(K * A, 4)
 
     return all_anchors
+
+
+if __name__ == '__main__':
+    anchor = generate_anchors()
+    print(anchor[:12, :])
+    print('nn')
+
+

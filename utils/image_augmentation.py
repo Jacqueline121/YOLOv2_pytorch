@@ -204,10 +204,3 @@ def augment_img(img, boxes, gt_classes):
     img = random_distort(img, cfg.HUE, cfg.SATURATION, cfg.EXPOSURE)
     return img, boxes, gt_classes
 
-
-
-
-
-
-
-
