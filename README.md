@@ -13,6 +13,27 @@ A Python3.5/Pytorch implementation of YOLOv2:[YOLO9000: Better, Faster, Stronger
 * matplotlib
 * easydict
 
+### Results
+#### mAP
+* Train on voc07trainval
+* Test on voc07test
+* The mAP is 70.2
+
+#### Loss
+
+The training loss curves:
+
+![Alt text](/result/loss.png)
+
+#### Detection Results
+![Alt text](/result/results.png)
+
+### Repo Organization
+* config: define configuration information of Faster RCNN
+* dataset: Scripts for creating, downloading, organizing datasets.
+* yolo: Neural networks and components that form parts of YOLOv2.
+* utils: tools package, containing some necessary functions.
+
 ### Installation
 1. Clone this repository (Faster_RCNN_pytorch):
     
@@ -22,12 +43,6 @@ A Python3.5/Pytorch implementation of YOLOv2:[YOLO9000: Better, Faster, Stronger
     
         cd YOLOv2_pytorch
         pip install -r requirements.txt
-
-### Repo Organization
-* config: define configuration information of Faster RCNN
-* dataset: Scripts for creating, downloading, organizing datasets.
-* yolo: Neural networks and components that form parts of YOLOv2.
-* utils: tools package, containing some necessary functions.
 
 ### Train
 
